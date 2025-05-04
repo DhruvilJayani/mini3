@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package replication;
+
+message Task {
+string id = 1;
+string type = 2;
+int32 priority = 3;
+int32 hop_count = 4;
+}
+
+message Ack {
+bool success = 1;
+string info = 2;
+}
+
+message StealRequest {
+int32 max_tasks = 1;
+}
+
+message TaskList {
+repeated Task tasks = 1;
+}
+
+message StatusRequest {}
+
+message Status {
+int32 queue_len = 1;
+float cpu_usage = 2;
+float mem_usage = 3;
+}
+
+service TaskService {
+rpc EnqueueTask(Task) returns (Ack);
+rpc StealTasks(StealRequest) returns (TaskList);
+rpc GetStatus(StatusRequest) returns (Status);
+}
