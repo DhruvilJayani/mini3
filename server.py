@@ -9,53 +9,54 @@ import random
 import generated.task_pb2 as task_pb2
 import generated.task_pb2_grpc as task_pb2_grpc
 
+# Define known peers
 PEERS = {
     "Server1": "localhost:50051",
     "Server2": "localhost:50052",
     "Server3": "localhost:50053"
 }
 
-
 class TaskService(task_pb2_grpc.TaskServiceServicer):
     def __init__(self, server_id, port, peers, capacity=100):
         self.server_id = server_id
         self.port = port
-        self.peers = peers  # dictionary of {peer_id: "host:port"}
-        self.queue = queue.Queue()
+        self.peers = peers  # Dictionary of peer_id: address
+        self.queue = queue.Queue(maxsize=capacity)  # Enforced capacity
         self.capacity = capacity
         self.lock = threading.Lock()
         print(f"[{self.server_id}] Server initialized.")
 
-        # Start the background work stealing thread
-        self.last_steal_time = time.time()
+        # Start background threads
         threading.Thread(target=self.run_work_stealer, daemon=True).start()
+        threading.Thread(target=self.run_task_worker, daemon=True).start()
 
     def EnqueueTask(self, request, context):
-        best_server = self.select_best_server(request.priority)
+        try:
+            self.queue.put(request, block=False)
+            print(f"[{self.server_id}] Enqueued task {request.id} locally")
+            return task_pb2.Ack(success=True, info="Enqueued locally")
+        except queue.Full:
+            print(f"[{self.server_id}] Queue full. Attempting to forward task {request.id}")
+            for peer_id, peer_addr in self.peers.items():
+                try:
+                    with grpc.insecure_channel(peer_addr) as ch:
+                        stub = task_pb2_grpc.TaskServiceStub(ch)
+                        forwarded_task = task_pb2.Task(
+                            id=request.id,
+                            type=request.type,
+                            priority=request.priority,
+                            hop_count=request.hop_count + 1
+                        )
+                        ack = stub.EnqueueTask(forwarded_task)
+                        if ack.success:
+                            print(f"[{self.server_id}] Forwarded task {request.id} to {peer_id}")
+                            return ack
+                except Exception as e:
+                    print(f"[{self.server_id}] Failed to forward to {peer_id}: {e}")
+                    continue
 
-        if best_server == self.server_id:
-            with self.lock:
-                if self.queue.qsize() < self.capacity:
-                    self.queue.put(request)
-                    print(f"[{self.server_id}] Enqueued task {request.id}")
-                    return task_pb2.Ack(success=True, info="Enqueued locally")
-                else:
-                    return task_pb2.Ack(success=False, info="Queue full")
-        else:
-            try:
-                target_addr = self.peers[best_server]
-                with grpc.insecure_channel(target_addr) as ch:
-                    stub = task_pb2_grpc.TaskServiceStub(ch)
-                    forwarded_task = task_pb2.Task(
-                        id=request.id,
-                        type=request.type,
-                        priority=request.priority,
-                        hop_count=request.hop_count + 1
-                    )
-                    return stub.EnqueueTask(forwarded_task)
-            except Exception as e:
-                print(f"[{self.server_id}] Failed to forward: {e}")
-                return task_pb2.Ack(success=False, info="Forwarding failed")
+            print(f"[{self.server_id}] All forward attempts failed for task {request.id}")
+            return task_pb2.Ack(success=False, info="Queue full and forwarding failed")
 
     def StealTasks(self, request, context):
         tasks = []
@@ -97,38 +98,14 @@ class TaskService(task_pb2_grpc.TaskServiceServicer):
             w_p * priority
         )
 
-    def select_best_server(self, priority):
-        best_id = self.server_id
-        best_score = self.calculate_score(self.get_local_metrics(), priority, distance=0)
-
-        for peer_id, peer_addr in self.peers.items():
-            try:
-                with grpc.insecure_channel(peer_addr) as ch:
-                    stub = task_pb2_grpc.TaskServiceStub(ch)
-                    status = stub.GetStatus(task_pb2.StatusRequest())
-                    metrics = {
-                        "queue_len": status.queue_len,
-                        "cpu": status.cpu_usage,
-                        "mem": status.mem_usage
-                    }
-                    score = self.calculate_score(metrics, priority, distance=1.0)
-                    if score > best_score:
-                        best_score = score
-                        best_id = peer_id
-            except Exception:
-                continue  # Skip unreachable peers
-
-        return best_id
-
     def run_work_stealer(self):
         while True:
-            time.sleep(5)  # Check every 5 seconds
-
+            time.sleep(5)
             with self.lock:
                 local_queue_len = self.queue.qsize()
 
             if local_queue_len > 5:
-                continue  # We're not idle
+                continue
 
             for peer_id, peer_addr in self.peers.items():
                 try:
@@ -145,12 +122,17 @@ class TaskService(task_pb2_grpc.TaskServiceServicer):
                                     self.queue.put(task)
 
                             print(f"[{self.server_id}] Stole {len(stolen_tasks)} tasks from {peer_id}")
-                            break  # Only steal from one peer per cycle
-
+                            break
                 except Exception:
-                    continue  # Peer unreachable, try next one
+                    continue
 
-
+    def run_task_worker(self):
+        while True:
+            task = self.queue.get()
+            print(f"[{self.server_id}] Processing task {task.id} (priority: {task.priority})")
+            time.sleep(random.uniform(0.2, 1.0))  # Simulate task work
+            print(f"[{self.server_id}] Finished task {task.id}")
+            self.queue.task_done()
 
 def serve(port, server_id):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))

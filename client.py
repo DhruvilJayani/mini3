@@ -39,4 +39,4 @@ def run_task_sender(num_tasks=10, delay=0.5):
         time.sleep(delay)
 
 if __name__ == "__main__":
-    run_task_sender(num_tasks=100, delay=0.1)
+    run_task_sender(num_tasks=200, delay=0.1)
