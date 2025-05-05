@@ -12,19 +12,27 @@ SERVER_ADDRESSES = [
     "localhost:50053"
 ]
 
-# PEERS = {
-#     "Server1": "192.168.1.10:50051",  # Machine A
-#     "Server2": "192.168.1.10:50052",  # Machine A
-#     "Server3": "192.168.1.10:50053",  # Machine A
-#     "Server4": "192.168.1.20:50051",  # Machine B
-#     "Server5": "192.168.1.20:50052",  # Machine B
-# }
+def send_task_with_retry(task, max_retries=3):
+    tried = set()
+    for _ in range(max_retries):
+        remaining = [addr for addr in SERVER_ADDRESSES if addr not in tried]
+        if not remaining:
+            print(f"[Client] Task {task.id} failed to send after retries.")
+            return
 
-def send_task(server_address, task):
-    with grpc.insecure_channel(server_address) as channel:
-        stub = task_pb2_grpc.TaskServiceStub(channel)
-        response = stub.EnqueueTask(task)
-        print(f"[Client] Sent task {task.id} to {server_address} | Response: {response.info}")
+        server_address = random.choice(remaining)
+        tried.add(server_address)
+
+        try:
+            with grpc.insecure_channel(server_address) as channel:
+                stub = task_pb2_grpc.TaskServiceStub(channel)
+                response = stub.EnqueueTask(task)
+                print(f"[Client] Sent task {task.id} to {server_address} | Response: {response.info}")
+                return
+        except grpc.RpcError as e:
+            print(f"[Client] Failed to send task {task.id} to {server_address}: {e.code().name}")
+
+    print(f"[Client] All retries failed for task {task.id}.")
 
 def run_task_sender(num_tasks=10, delay=0.5):
     for i in range(num_tasks):
@@ -34,9 +42,8 @@ def run_task_sender(num_tasks=10, delay=0.5):
             priority=random.randint(0, 2),
             hop_count=0
         )
-        server = random.choice(SERVER_ADDRESSES)
-        send_task(server, task)
+        send_task_with_retry(task)
         time.sleep(delay)
 
 if __name__ == "__main__":
-    run_task_sender(num_tasks=100, delay=0.1)
+    run_task_sender(num_tasks=200, delay=0.2)
