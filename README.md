@@ -58,6 +58,9 @@ python -m grpc_tools.protoc -I./protos --python_out=./generated --grpc_python_ou
 
 touch generated/__init__.py
 
+## To Stop Particular Port
+pkill -f "server.py --port=50052"
+
 
 Run Command 
 
