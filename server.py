@@ -13,7 +13,9 @@ import generated.task_pb2_grpc as task_pb2_grpc
 PEERS = {
     "Server1": "localhost:50051",
     "Server2": "localhost:50052",
-    "Server3": "localhost:50053"
+    "Server3": "localhost:50053",
+    "Server4": "localhost:50054",
+    "Server5": "localhost:50055"
 }
 
 class TaskService(task_pb2_grpc.TaskServiceServicer):
@@ -24,6 +26,7 @@ class TaskService(task_pb2_grpc.TaskServiceServicer):
         self.queue = queue.Queue(maxsize=capacity)  # Enforced capacity
         self.capacity = capacity
         self.lock = threading.Lock()
+        self.alive_peers_lock = threading.Lock()
         self.alive_peers = set(peers.keys())  # Track reachable peers
         print(f"[{self.server_id}] Server initialized.")
 
@@ -39,8 +42,28 @@ class TaskService(task_pb2_grpc.TaskServiceServicer):
             return task_pb2.Ack(success=True, info="Enqueued locally")
         except queue.Full:
             print(f"[{self.server_id}] Queue full. Attempting to forward task {request.id}")
-            for peer_id in self.alive_peers:
-                peer_addr = self.peers[peer_id]
+            scored_peers = []
+
+            with self.alive_peers_lock:
+                for peer_id in self.alive_peers:
+                    peer_addr = self.peers[peer_id]
+                    try:
+                        with grpc.insecure_channel(peer_addr) as ch:
+                            stub = task_pb2_grpc.TaskServiceStub(ch)
+                            status = stub.GetStatus(task_pb2.StatusRequest())
+                            metrics = {
+                                "queue_len": status.queue_len,
+                                "cpu": status.cpu_usage,
+                                "mem": status.mem_usage
+                            }
+                            score = self.calculate_score(metrics, request.priority)
+                            scored_peers.append((score, peer_id, peer_addr))
+                    except Exception as e:
+                        print(f"[{self.server_id}] Failed to get status from {peer_id}: {e}")
+
+            scored_peers.sort(reverse=True)  # Highest score first
+
+            for _, peer_id, peer_addr in scored_peers:
                 try:
                     with grpc.insecure_channel(peer_addr) as ch:
                         stub = task_pb2_grpc.TaskServiceStub(ch)
@@ -56,7 +79,6 @@ class TaskService(task_pb2_grpc.TaskServiceServicer):
                             return ack
                 except Exception as e:
                     print(f"[{self.server_id}] Failed to forward to {peer_id}: {e}")
-                    continue
 
             print(f"[{self.server_id}] All forward attempts failed for task {request.id}")
             return task_pb2.Ack(success=False, info="Queue full and forwarding failed")
@@ -110,25 +132,26 @@ class TaskService(task_pb2_grpc.TaskServiceServicer):
             if local_queue_len > 5:
                 continue
 
-            for peer_id in self.alive_peers:
-                peer_addr = self.peers[peer_id]
-                try:
-                    with grpc.insecure_channel(peer_addr) as ch:
-                        stub = task_pb2_grpc.TaskServiceStub(ch)
-                        status = stub.GetStatus(task_pb2.StatusRequest())
+            with self.alive_peers_lock:
+                for peer_id in self.alive_peers:
+                    peer_addr = self.peers[peer_id]
+                    try:
+                        with grpc.insecure_channel(peer_addr) as ch:
+                            stub = task_pb2_grpc.TaskServiceStub(ch)
+                            status = stub.GetStatus(task_pb2.StatusRequest())
 
-                        if status.queue_len > 15:
-                            steal_req = task_pb2.StealRequest(max_tasks=5)
-                            stolen_tasks = stub.StealTasks(steal_req).tasks
+                            if status.queue_len > 15:
+                                steal_req = task_pb2.StealRequest(max_tasks=5)
+                                stolen_tasks = stub.StealTasks(steal_req).tasks
 
-                            with self.lock:
-                                for task in stolen_tasks:
-                                    self.queue.put(task)
+                                with self.lock:
+                                    for task in stolen_tasks:
+                                        self.queue.put(task)
 
-                            print(f"[{self.server_id}] Stole {len(stolen_tasks)} tasks from {peer_id}")
-                            break
-                except Exception:
-                    continue
+                                print(f"[{self.server_id}] Stole {len(stolen_tasks)} tasks from {peer_id}")
+                                break
+                    except Exception:
+                        continue
 
     def run_task_worker(self):
         while True:
@@ -150,7 +173,9 @@ class TaskService(task_pb2_grpc.TaskServiceServicer):
                         alive.add(peer_id)
                 except:
                     print(f"[{self.server_id}] Peer {peer_id} is unreachable.")
-            self.alive_peers = alive
+            with self.alive_peers_lock:
+                self.alive_peers = alive
+
 
 def serve(port, server_id):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
