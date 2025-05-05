@@ -24,11 +24,13 @@ class TaskService(task_pb2_grpc.TaskServiceServicer):
         self.queue = queue.Queue(maxsize=capacity)  # Enforced capacity
         self.capacity = capacity
         self.lock = threading.Lock()
+        self.alive_peers = set(peers.keys())  # Track reachable peers
         print(f"[{self.server_id}] Server initialized.")
 
         # Start background threads
         threading.Thread(target=self.run_work_stealer, daemon=True).start()
         threading.Thread(target=self.run_task_worker, daemon=True).start()
+        threading.Thread(target=self.run_heartbeat_monitor, daemon=True).start()
 
     def EnqueueTask(self, request, context):
         try:
@@ -37,7 +39,8 @@ class TaskService(task_pb2_grpc.TaskServiceServicer):
             return task_pb2.Ack(success=True, info="Enqueued locally")
         except queue.Full:
             print(f"[{self.server_id}] Queue full. Attempting to forward task {request.id}")
-            for peer_id, peer_addr in self.peers.items():
+            for peer_id in self.alive_peers:
+                peer_addr = self.peers[peer_id]
                 try:
                     with grpc.insecure_channel(peer_addr) as ch:
                         stub = task_pb2_grpc.TaskServiceStub(ch)
@@ -107,7 +110,8 @@ class TaskService(task_pb2_grpc.TaskServiceServicer):
             if local_queue_len > 5:
                 continue
 
-            for peer_id, peer_addr in self.peers.items():
+            for peer_id in self.alive_peers:
+                peer_addr = self.peers[peer_id]
                 try:
                     with grpc.insecure_channel(peer_addr) as ch:
                         stub = task_pb2_grpc.TaskServiceStub(ch)
@@ -133,6 +137,20 @@ class TaskService(task_pb2_grpc.TaskServiceServicer):
             time.sleep(random.uniform(0.2, 1.0))  # Simulate task work
             print(f"[{self.server_id}] Finished task {task.id}")
             self.queue.task_done()
+
+    def run_heartbeat_monitor(self):
+        while True:
+            time.sleep(3)
+            alive = set()
+            for peer_id, peer_addr in self.peers.items():
+                try:
+                    with grpc.insecure_channel(peer_addr) as ch:
+                        stub = task_pb2_grpc.TaskServiceStub(ch)
+                        _ = stub.GetStatus(task_pb2.StatusRequest())
+                        alive.add(peer_id)
+                except:
+                    print(f"[{self.server_id}] Peer {peer_id} is unreachable.")
+            self.alive_peers = alive
 
 def serve(port, server_id):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
